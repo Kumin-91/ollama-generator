@@ -1,0 +1,31 @@
+# LM Studio local runtime
+.lmstudio
+
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and editor temporary files
+npm-debug.log*
+*.swp
+*.swo
+*~
+
+# macOS metadata and archive sidecars
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+__MACOSX/
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
