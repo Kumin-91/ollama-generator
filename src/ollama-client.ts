@@ -6,6 +6,7 @@ import { type OllamaSettings } from "./ollama-settings";
 export interface OllamaMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  images?: string[];
   tool_calls?: { id: string; function: { name: string; arguments: Record<string, unknown> } }[];
   tool_name?: string;
   tool_call_id?: string;
@@ -64,27 +65,20 @@ function parseChunk(line: string): OllamaChunk {
   };
 }
 
-export async function* streamOllamaChat(
+async function postOllama(
   settings: OllamaSettings,
-  messages: OllamaMessage[],
-  tools: LLMTool[],
-  overrides: GenerationOptions,
+  endpoint: "show" | "chat",
+  body: Record<string, unknown>,
   signal: AbortSignal,
-): AsyncGenerator<OllamaChunk> {
+): Promise<Response> {
   signal.throwIfAborted();
-  const response = await fetch(`${settings.serverUrl}/api/chat`, {
+  const response = await fetch(`${settings.serverUrl}/api/${endpoint}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}),
     },
-    body: JSON.stringify({
-      model: settings.model,
-      messages,
-      ...(tools.length ? { tools } : {}),
-      stream: true,
-      ...overrides,
-    }),
+    body: JSON.stringify({ model: settings.model, ...body }),
     signal,
   });
   if (!response.ok) {
@@ -93,6 +87,33 @@ export async function* streamOllamaChat(
       ? `Ollama (${response.status}): ${error.error}`
       : `Ollama request failed (HTTP ${response.status}).`);
   }
+  return response;
+}
+
+export async function* streamOllamaChat(
+  settings: OllamaSettings,
+  messages: OllamaMessage[],
+  tools: LLMTool[],
+  overrides: GenerationOptions,
+  signal: AbortSignal,
+): AsyncGenerator<OllamaChunk> {
+  if (messages.some(message => message.images?.length)) {
+    const response = await postOllama(settings, "show", {}, signal);
+    const model: unknown = await response.json();
+    if (!isRecord(model) || !Array.isArray(model.capabilities)
+      || !model.capabilities.every(capability => typeof capability === "string")) {
+      throw new Error("Ollama did not return valid model capabilities for image input.");
+    }
+    if (!model.capabilities.includes("vision")) {
+      throw new Error(`Model "${settings.model}" does not support image input. Select a vision model.`);
+    }
+  }
+  const response = await postOllama(settings, "chat", {
+    messages,
+    ...(tools.length ? { tools } : {}),
+    stream: true,
+    ...overrides,
+  }, signal);
   if (!response.body) throw new Error("Ollama returned an empty response body.");
 
   const reader = response.body.getReader();

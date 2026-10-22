@@ -1,4 +1,5 @@
-import { type Chat, type GeneratorController, type ToolCallRequest } from "@lmstudio/sdk";
+import { type Chat, type ChatMessage, type GeneratorController, type ToolCallRequest } from "@lmstudio/sdk";
+import { readFile } from "node:fs/promises";
 import { configSchematics, globalConfigSchematics } from "./config";
 import { resolveGenerationOptions } from "./generation-options";
 import { type OllamaMessage, streamOllamaChat } from "./ollama-client";
@@ -9,18 +10,40 @@ function requireToolCallId(id: string | undefined): string {
   return id;
 }
 
-function toOllamaMessages(history: Chat): OllamaMessage[] {
+async function readImages(message: ChatMessage, ctl: GeneratorController): Promise<string[]> {
+  if (!message.hasFiles()) return [];
+  const files = message.getFiles(ctl.client);
+  if (files.some(file => !file.isImage())) {
+    throw new Error("Only image attachments are supported by this generator.");
+  }
+  if (message.getRole() !== "user") {
+    throw new Error("Image attachments are only supported in user messages.");
+  }
+  const images: string[] = [];
+  for (const file of files) {
+    ctl.abortSignal.throwIfAborted();
+    // SDK 1.4 cannot resolve a file path for inline Base64 handles.
+    const image = file.identifier.startsWith("base64:")
+      ? file.identifier.slice("base64:".length)
+      : (await readFile(await file.getFilePath(), { signal: ctl.abortSignal })).toString("base64");
+    ctl.abortSignal.throwIfAborted();
+    if (!image) throw new Error(`Image attachment "${file.name}" is empty.`);
+    images.push(image);
+  }
+  return images;
+}
+
+async function toOllamaMessages(history: Chat, ctl: GeneratorController): Promise<OllamaMessage[]> {
   const messages: OllamaMessage[] = [];
   const toolNames = new Map<string, string>();
   for (const message of history) {
-    if (message.hasFiles()) {
-      throw new Error("File attachments are not supported by this generator yet.");
-    }
+    ctl.abortSignal.throwIfAborted();
+    const images = await readImages(message, ctl);
     const role = message.getRole();
     switch (role) {
       case "system":
       case "user":
-        messages.push({ role, content: message.getText() });
+        messages.push({ role, content: message.getText(), ...(images.length ? { images } : {}) });
         break;
       case "assistant": {
         const toolCalls = message.getToolCallRequests().map(call => {
@@ -61,7 +84,7 @@ export async function generate(ctl: GeneratorController, history: Chat) {
       apiKey: globalConfig.get("apiKey"),
       model: config.get("model"),
     });
-    const stream = streamOllamaChat(settings, toOllamaMessages(history), ctl.getToolDefinitions(),
+    const stream = streamOllamaChat(settings, await toOllamaMessages(history, ctl), ctl.getToolDefinitions(),
       resolveGenerationOptions(globalConfig), ctl.abortSignal);
     const calls: ToolCallRequest[] = [];
     const callIds = new Set<string>();
