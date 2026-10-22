@@ -1,20 +1,20 @@
 {
   "name": "lms-plugin-ollama-generator",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Use your Ollama models in LM Studio.",
   "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "dev": "lms dev",
     "push": "lms push"
   },
-  "author": "",
   "license": "ISC",
   "dependencies": {
     "@lmstudio/sdk": "1.4.0",
-    "openai": "^5.2.0",
-    "zod": "3.24.1"
+    "openai": "^5.2.0"
   },
   "devDependencies": {
-    "@types/node": "^20.14.8"
+    "@types/node": "^20.14.8",
+    "typescript": "5.8.3"
   }
 }

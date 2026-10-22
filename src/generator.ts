@@ -1,214 +1,144 @@
-import { type Chat, type GeneratorController, type InferParsedConfig } from "@lmstudio/sdk";
+import { randomUUID } from "node:crypto";
+import { type Chat, type GeneratorController, type ToolCallRequest } from "@lmstudio/sdk";
 import OpenAI from "openai";
 import {
+  type ChatCompletionChunk,
   type ChatCompletionMessageParam,
   type ChatCompletionMessageToolCall,
   type ChatCompletionTool,
-  type ChatCompletionToolMessageParam,
-} from "openai/resources/index";
+} from "openai/resources/chat/completions";
 import { configSchematics, globalConfigSchematics } from "./config";
-
-/* -------------------------------------------------------------------------- */
-/*                                   Types                                    */
-/* -------------------------------------------------------------------------- */
+import { resolveOllamaSettings } from "./ollama-settings";
 
 type ToolCallState = {
-  id: string;
-  name: string | null;
-  index: number;
+  id?: string;
+  name?: string;
   arguments: string;
 };
 
-/* -------------------------------------------------------------------------- */
-/*                               Build helpers                                */
-/* -------------------------------------------------------------------------- */
-
-/** Build a pre-configured OpenAI client. */
-function createOpenAI(
-  globalConfig: InferParsedConfig<typeof globalConfigSchematics>,
-  isOpenAIModel: boolean,
-) {
-  const overrideBaseUrl = globalConfig.get("overrideBaseUrl");
-
-  // Use override URL if provided, otherwise auto-detect based on model type
-  const baseURL =
-    overrideBaseUrl ||
-    (isOpenAIModel ? "https://api.openai.com/v1" : "https://api.anthropic.com/v1");
-
-  const apiKey = isOpenAIModel
-    ? globalConfig.get("openaiApiKey")
-    : globalConfig.get("anthropicApiKey");
-
-  return new OpenAI({
-    apiKey,
-    baseURL,
-  });
+function requireToolCallId(id: string | undefined): string {
+  if (!id) throw new Error("Tool call history is missing a call ID.");
+  return id;
 }
 
-/** Convert internal chat history to the format expected by OpenAI. */
 function toOpenAIMessages(history: Chat): ChatCompletionMessageParam[] {
   const messages: ChatCompletionMessageParam[] = [];
 
   for (const message of history) {
-    switch (message.getRole()) {
+    const role = message.getRole();
+    switch (role) {
       case "system":
-        messages.push({ role: "system", content: message.getText() });
-        break;
-
       case "user":
-        messages.push({ role: "user", content: message.getText() });
+        messages.push({ role, content: message.getText() });
         break;
-
       case "assistant": {
-        const toolCalls: ChatCompletionMessageToolCall[] = message
-          .getToolCallRequests()
-          .map(toolCall => ({
-            id: toolCall.id ?? "",
-            type: "function",
-            function: {
-              name: toolCall.name,
-              arguments: JSON.stringify(toolCall.arguments ?? {}),
-            },
-          }));
-
+        const toolCalls = message.getToolCallRequests().map<ChatCompletionMessageToolCall>(call => ({
+          id: requireToolCallId(call.id),
+          type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+        }));
         messages.push({
-          role: "assistant",
+          role,
           content: message.getText(),
           ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         });
         break;
       }
-
-      case "tool": {
-        message.getToolCallResults().forEach(toolCallResult => {
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCallResult.toolCallId ?? "",
-            content: toolCallResult.content,
-          } as ChatCompletionToolMessageParam);
-        });
+      case "tool":
+        for (const result of message.getToolCallResults()) {
+          messages.push({ role, tool_call_id: requireToolCallId(result.toolCallId), content: result.content });
+        }
         break;
-      }
     }
   }
-
   return messages;
 }
 
-/** Convert LM Studio tool definitions to OpenAI function-tool descriptors. */
-function toOpenAITools(ctl: GeneratorController): ChatCompletionTool[] | undefined {
-  const tools = ctl.getToolDefinitions().map<ChatCompletionTool>(t => ({
-    type: "function",
-    function: {
-      name: t.function.name,
-      description: t.function.description,
-      parameters: t.function.parameters ?? {},
-    },
-  }));
-  return tools.length ? tools : undefined;
-}
+function parseToolCall(call: ToolCallState): ToolCallRequest {
+  if (!call.name) throw new Error("Tool call is missing a function name.");
 
-/* -------------------------------------------------------------------------- */
-/*                            Stream-handling utils                           */
-/* -------------------------------------------------------------------------- */
-
-function wireAbort(ctl: GeneratorController, stream: { controller: AbortController }) {
-  ctl.onAborted(() => {
-    console.info("Generation aborted by user.");
-    stream.controller.abort();
-  });
-}
-
-async function consumeStream(stream: AsyncIterable<any>, ctl: GeneratorController) {
-  let current: ToolCallState | null = null;
-
-  function maybeFlushCurrentToolCall() {
-    if (current === null || current.name === null) {
-      return;
-    }
-    ctl.toolCallGenerationEnded({
-      type: "function",
-      name: current.name,
-      arguments: JSON.parse(current.arguments),
-      id: current.id,
-    });
-    current = null;
+  let args: unknown;
+  try {
+    args = JSON.parse(call.arguments || "{}");
+  } catch {
+    throw new Error("Tool call arguments must be valid JSON.");
   }
+  if (typeof args !== "object" || args === null || Array.isArray(args)) {
+    throw new Error("Tool call arguments must be a JSON object.");
+  }
+  return {
+    type: "function",
+    id: call.id || randomUUID(),
+    name: call.name,
+    arguments: args as Record<string, unknown>,
+  };
+}
+
+async function consumeStream(stream: AsyncIterable<ChatCompletionChunk>, ctl: GeneratorController) {
+  const pending = new Map<number, ToolCallState>();
 
   for await (const chunk of stream) {
-    console.info("Received chunk:", JSON.stringify(chunk));
-    const delta = chunk.choices?.[0]?.delta as
-      | {
-          content?: string;
-          tool_calls?: Array<{
-            index: number;
-            id?: string;
-            function?: { name?: string; arguments?: string };
-          }>;
-        }
-      | undefined;
+    ctl.abortSignal.throwIfAborted();
+    const choice = chunk.choices[0];
+    if (!choice) continue;
 
-    if (!delta) continue;
+    if (choice.delta.content) ctl.fragmentGenerated(choice.delta.content);
 
-    /* Text streaming */
-    if (delta.content) {
-      ctl.fragmentGenerated(delta.content);
+    for (const delta of choice.delta.tool_calls ?? []) {
+      const call = pending.get(delta.index) ?? { arguments: "" };
+      if (delta.id) call.id = delta.id;
+      if (delta.function?.name) call.name = delta.function.name;
+      if (delta.function?.arguments) call.arguments += delta.function.arguments;
+      pending.set(delta.index, call);
     }
 
-    /* Tool-call streaming */
-    for (const toolCall of delta.tool_calls ?? []) {
-      if (toolCall.id !== undefined) {
-        maybeFlushCurrentToolCall();
-        current = { id: toolCall.id, name: null, index: toolCall.index, arguments: "" };
-        ctl.toolCallGenerationStarted();
+    if (choice.finish_reason === "tool_calls") {
+      if (!pending.size) throw new Error("Server finished tool generation without a tool call.");
+      // Validate every call before reporting them sequentially to LM Studio.
+      const calls = [...pending].sort(([a], [b]) => a - b).map(([, call]) => parseToolCall(call));
+      for (const call of calls) {
+        ctl.abortSignal.throwIfAborted();
+        ctl.toolCallGenerationStarted({ toolCallId: call.id });
+        ctl.toolCallGenerationNameReceived(call.name);
+        ctl.toolCallGenerationArgumentFragmentGenerated(JSON.stringify(call.arguments));
+        ctl.toolCallGenerationEnded(call);
       }
-
-      if (toolCall.function?.name && current) {
-        current.name = toolCall.function.name;
-        ctl.toolCallGenerationNameReceived(toolCall.function.name);
-      }
-
-      if (toolCall.function?.arguments && current) {
-        current.arguments += toolCall.function.arguments;
-        ctl.toolCallGenerationArgumentFragmentGenerated(toolCall.function.arguments);
-      }
-    }
-
-    /* Finalize tool call */
-    if (chunk.choices?.[0]?.finish_reason === "tool_calls" && current?.name) {
-      maybeFlushCurrentToolCall();
+      pending.clear();
     }
   }
 
-  console.info("Generation completed.");
+  ctl.abortSignal.throwIfAborted();
+  if (pending.size) throw new Error("Tool call stream ended before completion.");
 }
-
-/* -------------------------------------------------------------------------- */
-/*                                     API                                    */
-/* -------------------------------------------------------------------------- */
 
 export async function generate(ctl: GeneratorController, history: Chat) {
   const config = ctl.getPluginConfig(configSchematics);
-  const model = config.get("model");
-
-  // Choose the appropriate config fields based on the model
-  const isOpenAIModel = model.startsWith("gpt-");
   const globalConfig = ctl.getGlobalPluginConfig(globalConfigSchematics);
-
-  /* 1. Setup client & payload */
-  const openai = createOpenAI(globalConfig, isOpenAIModel);
-  const messages = toOpenAIMessages(history);
-  const tools = toOpenAITools(ctl);
-
-  /* 2. Kick off streaming completion */
-  const stream = await openai.chat.completions.create({
-    model: model,
-    messages,
-    tools,
-    stream: true,
+  const settings = resolveOllamaSettings({
+    serverUrl: globalConfig.get("serverUrl"),
+    apiKey: globalConfig.get("apiKey"),
+    model: config.get("model"),
   });
+  const client = new OpenAI({
+    baseURL: `${settings.serverUrl}/v1`,
+    apiKey: settings.apiKey ?? "ollama",
+    defaultHeaders: settings.apiKey ? undefined : { Authorization: null },
+    maxRetries: 0,
+  });
+  const tools: ChatCompletionTool[] = ctl.getToolDefinitions().map(tool => ({
+    type: "function",
+    function: {
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters ?? {},
+    },
+  }));
+  const stream = await client.chat.completions.create({
+    model: settings.model,
+    messages: toOpenAIMessages(history),
+    tools: tools.length ? tools : undefined,
+    stream: true,
+  }, { signal: ctl.abortSignal });
 
-  /* 3. Abort wiring & stream processing */
-  wireAbort(ctl, stream as any);
-  await consumeStream(stream as any, ctl);
+  await consumeStream(stream, ctl);
 }

@@ -1,53 +1,36 @@
 import { createConfigSchematics } from "@lmstudio/sdk";
 
-// This file contains the definition of configuration schematics for your plugin.
-
 export const configSchematics = createConfigSchematics()
   .field(
     "model",
-    "select",
+    "string",
     {
       displayName: "Model",
-      subtitle: "Select the model to use for generation.",
-      options: [
-        { value: "claude-sonnet-4-20250514", displayName: "claude-sonnet-4-20250514" },
-        { value: "claude-opus-4-20250514", displayName: "claude-opus-4-20250514" },
-        { value: "gpt-4.1-2025-04-14", displayName: "gpt-4.1-2025-04-14" },
-        { value: "gpt-4.1-mini-2025-04-14", displayName: "gpt-4.1-mini-2025-04-14" },
-      ],
+      subtitle: "Enter the exact model name, including its tag.",
+      placeholder: "LiquidAI/lfm2.5-1.2b-instruct:q8_0",
     },
-    "claude-sonnet-4-20250514",
+    "",
   )
   .build();
 
 export const globalConfigSchematics = createConfigSchematics()
   .field(
-    "openaiApiKey",
+    "serverUrl",
     "string",
     {
-      displayName: "OpenAI API Key",
-      isProtected: true,
-      placeholder: "sk-...",
+      displayName: "Ollama Server URL",
+      subtitle: "Ollama server address accessible from this device.",
+      placeholder: "http://server:11434",
     },
     "",
   )
   .field(
-    "anthropicApiKey",
+    "apiKey",
     "string",
     {
-      displayName: "Anthropic API Key",
+      displayName: "API Key (Optional)",
+      subtitle: "Only needed if your server requires authentication.",
       isProtected: true,
-      placeholder: "ant-...",
-    },
-    "",
-  )
-    .field(
-    "overrideBaseUrl",
-    "string",
-    {
-      displayName: "(Optional) Override Base URL",
-      subtitle: "Override the base URL for API calls. Leave empty to let the plugin guess the base URL.",
-      placeholder: "https://api.example.com/v1",
     },
     "",
   )
