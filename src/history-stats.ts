@@ -1,11 +1,3 @@
-import { type OllamaUsage } from "./ollama-client";
-
-export interface StatsOptions {
-  tokens: boolean;
-  time: boolean;
-  context: boolean;
-}
-
 const legacyFooterPattern = /\n\n<!-- ollama-generator:stats:v1:start -->\n\n---\n\n(?:Input|Output|Context):[^\n]*(?:  \n(?:Input|Output|Context):[^\n]*)*\n\n<!-- ollama-generator:stats:v1:end -->\s*$/;
 const timeValue = "(?:N/A|\\d+\\.\\d{2}s)";
 const footerSeparator = "\n\n---\n";
@@ -26,7 +18,7 @@ function hasOpenCodeFence(content: string): boolean {
   return !!fence;
 }
 
-// Recognize the compact footer after a restart, preserving code samples and ordinary prose.
+// Remove statistics from older conversations without stripping code samples or ordinary prose.
 export function stripStatsFooter(content: string): string {
   const legacyStart = content.search(legacyFooterPattern);
   const text = legacyStart !== -1 && !hasOpenCodeFence(content.slice(0, legacyStart))
@@ -42,40 +34,4 @@ export function stripStatsFooter(content: string): string {
     previous = index;
   }
   return text.slice(0, start);
-}
-
-function count(value: number | undefined): string {
-  return value === undefined ? "N/A" : value.toLocaleString("en-US");
-}
-
-function seconds(value: number | undefined): string {
-  return value === undefined ? "N/A" : `${value.toFixed(2)}s`;
-}
-
-export function formatStatsFooter(
-  options: StatsOptions,
-  usage: OllamaUsage | undefined,
-  firstSeconds: number | undefined,
-  contextLength: number | undefined,
-): string {
-  const lines: string[] = [];
-  if (options.tokens) {
-    const speed = usage?.outputTokens !== undefined && usage.outputSeconds !== undefined
-      && usage.outputSeconds > 0 ? (usage.outputTokens / usage.outputSeconds).toFixed(2) : "N/A";
-    lines.push(`**Token Stats:** ${speed} tok/sec | ${count(usage?.outputTokens)} tokens`);
-  }
-  if (options.time) {
-    lines.push(`**Time:** Processing ${seconds(usage?.promptSeconds)} | First ${seconds(firstSeconds)}`
-      + ` | Total ${seconds(usage?.totalSeconds)}`);
-  }
-  if (options.context) {
-    const used = usage?.promptTokens !== undefined && usage.outputTokens !== undefined
-      && Number.isSafeInteger(usage.promptTokens + usage.outputTokens)
-      ? usage.promptTokens + usage.outputTokens : undefined;
-    const percentage = used !== undefined && contextLength !== undefined
-      ? `${(used / contextLength * 100).toFixed(2)}%` : "N/A";
-    lines.push(`**Context:** ${count(used)}`
-      + ` / ${count(contextLength)} tokens (${percentage})`);
-  }
-  return lines.length ? `${footerSeparator}${lines.join("\n")}` : "";
 }

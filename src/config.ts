@@ -1,13 +1,16 @@
 import {
   createConfigSchematics,
   type ConfigSchematicsBuilder,
+  type GeneratorController,
   type GlobalKVFieldValueTypeLibraryMap,
   type VirtualConfigSchematics,
 } from "@lmstudio/sdk";
+import { resolveGenerationOptions } from "./generation-options";
+import { resolveOllamaSettings } from "./ollama-settings";
 
 export type CheckboxNumericValue = GlobalKVFieldValueTypeLibraryMap["checkboxNumeric"]["value"];
 
-type SettingsFieldType = "string" | "select" | "checkboxNumeric" | "boolean";
+type SettingsFieldType = Parameters<ConfigSchematicsBuilder<{}>["field"]>[1] | "checkboxNumeric";
 type SettingsBuilder<T extends VirtualConfigSchematics> = Omit<ConfigSchematicsBuilder<T>, "field"> & {
   field<TKey extends string, TType extends SettingsFieldType>(
     key: TKey,
@@ -106,17 +109,24 @@ export const globalConfigSchematics = createSettingsBuilder()
     hint: "Use -1 for a random seed.",
     min: -1, max: 2147483647, int: true,
   }, { checked: false, value: 0 })
-  // Preserve stored keys so existing statistics settings keep their enabled state.
-  .field("outputStats", "boolean", {
-    displayName: "(Alpha) Token Stats",
-    subtitle: "Append output speed and generated token count.",
-  }, false)
-  .field("inputStats", "boolean", {
-    displayName: "(Alpha) Time Stats",
-    subtitle: "First includes network time; Processing and Total are server times.",
-  }, false)
   .field("contextUsage", "boolean", {
     displayName: "(Alpha) Context Usage",
-    subtitle: "Append estimated context usage and the loaded context limit.",
+    subtitle: "Show estimated context usage below the response.",
   }, false)
   .build();
+
+export function resolveGenerationConfig(
+  ctl: Pick<GeneratorController, "getPluginConfig" | "getGlobalPluginConfig">,
+) {
+  const config = ctl.getPluginConfig(configSchematics);
+  const globalConfig = ctl.getGlobalPluginConfig(globalConfigSchematics);
+  return {
+    settings: resolveOllamaSettings({
+      serverUrl: globalConfig.get("serverUrl"),
+      apiKey: globalConfig.get("apiKey"),
+      model: config.get("model"),
+    }),
+    options: resolveGenerationOptions(globalConfig),
+    contextUsage: globalConfig.get("contextUsage"),
+  };
+}

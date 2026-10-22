@@ -3,9 +3,15 @@ import { randomUUID } from "node:crypto";
 import { type GenerationOptions } from "./generation-options";
 import { type OllamaSettings } from "./ollama-settings";
 
+export type OllamaToolCall = ToolCallRequest & {
+  id: string;
+  arguments: Record<string, unknown>;
+};
+
 export interface OllamaMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  thinking?: string;
   images?: string[];
   tool_calls?: { id: string; function: { name: string; arguments: Record<string, unknown> } }[];
   tool_name?: string;
@@ -14,17 +20,32 @@ export interface OllamaMessage {
 
 export interface OllamaUsage {
   promptTokens?: number;
-  promptSeconds?: number;
   outputTokens?: number;
   outputSeconds?: number;
-  totalSeconds?: number;
 }
 
 interface OllamaChunk {
   done: boolean;
+  doneReason?: string;
   content: string;
   thinking: string;
-  toolCalls: ToolCallRequest[];
+  toolCalls: OllamaToolCall[];
+  usage?: OllamaUsage;
+}
+
+export interface OllamaGenerationRequest {
+  settings: OllamaSettings;
+  messages: OllamaMessage[];
+  tools: LLMTool[];
+  options: GenerationOptions;
+  signal: AbortSignal;
+  onThinking: (text: string) => void;
+  onContent: (text: string) => void;
+}
+
+export interface OllamaGenerationResult {
+  toolCalls: OllamaToolCall[];
+  doneReason?: string;
   usage?: OllamaUsage;
   firstSeconds?: number;
 }
@@ -42,7 +63,7 @@ function durationSeconds(value: unknown): number | undefined {
   return duration === undefined ? undefined : duration / 1e9;
 }
 
-function parseToolCall(value: unknown): ToolCallRequest {
+function parseToolCall(value: unknown): OllamaToolCall {
   if (!isRecord(value) || !isRecord(value.function)
     || typeof value.function.name !== "string" || !value.function.name
     || !isRecord(value.function.arguments)
@@ -78,15 +99,14 @@ function parseChunk(line: string): OllamaChunk {
   }
   return {
     done: value.done,
+    ...(value.done && typeof value.done_reason === "string" ? { doneReason: value.done_reason } : {}),
     content: message.content ?? "",
     thinking: message.thinking ?? "",
     toolCalls: (message.tool_calls ?? []).map(parseToolCall),
     ...(value.done ? { usage: {
       promptTokens: nonnegativeInteger(value.prompt_eval_count),
-      promptSeconds: durationSeconds(value.prompt_eval_duration),
       outputTokens: nonnegativeInteger(value.eval_count),
       outputSeconds: durationSeconds(value.eval_duration),
-      totalSeconds: durationSeconds(value.total_duration),
     } } : {}),
   };
 }
@@ -143,13 +163,9 @@ export async function getOllamaContextLength(
   }
 }
 
-export async function* streamOllamaChat(
-  settings: OllamaSettings,
-  messages: OllamaMessage[],
-  tools: LLMTool[],
-  overrides: GenerationOptions,
-  signal: AbortSignal,
-): AsyncGenerator<OllamaChunk> {
+export async function generateOllama({
+  settings, messages, tools, options, signal, onThinking, onContent,
+}: OllamaGenerationRequest): Promise<OllamaGenerationResult> {
   if (messages.some(message => message.images?.length)) {
     const response = await requestOllama(settings, "show", {}, signal);
     const model: unknown = await response.json();
@@ -166,7 +182,7 @@ export async function* streamOllamaChat(
     messages,
     ...(tools.length ? { tools } : {}),
     stream: true,
-    ...overrides,
+    ...options,
   }, signal);
   if (!response.body) throw new Error("Ollama returned an empty response body.");
 
@@ -174,6 +190,8 @@ export async function* streamOllamaChat(
   const decoder = new TextDecoder();
   let buffer = "";
   let firstSeconds: number | undefined;
+  const toolCalls: OllamaToolCall[] = [];
+  const callIds = new Set<string>();
   try {
     while (true) {
       signal.throwIfAborted();
@@ -190,9 +208,16 @@ export async function* streamOllamaChat(
         if (firstSeconds === undefined && (chunk.content || chunk.thinking || chunk.toolCalls.length)) {
           firstSeconds = (performance.now() - startedAt) / 1000;
         }
-        if (chunk.done) chunk.firstSeconds = firstSeconds;
-        yield chunk;
-        if (chunk.done) return;
+        if (chunk.thinking) onThinking(chunk.thinking);
+        if (chunk.content) onContent(chunk.content);
+        for (const call of chunk.toolCalls) {
+          if (callIds.has(call.id)) throw new Error("Ollama returned a duplicate tool call ID.");
+          callIds.add(call.id);
+          toolCalls.push(call);
+        }
+        signal.throwIfAborted();
+        // Tool calls are available only after a successful, complete stream.
+        if (chunk.done) return { toolCalls, usage: chunk.usage, firstSeconds, doneReason: chunk.doneReason };
       }
       if (done) break;
     }
