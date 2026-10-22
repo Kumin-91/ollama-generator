@@ -12,15 +12,34 @@ export interface OllamaMessage {
   tool_call_id?: string;
 }
 
+export interface OllamaUsage {
+  promptTokens?: number;
+  promptSeconds?: number;
+  outputTokens?: number;
+  outputSeconds?: number;
+  totalSeconds?: number;
+}
+
 interface OllamaChunk {
   done: boolean;
   content: string;
   thinking: string;
   toolCalls: ToolCallRequest[];
+  usage?: OllamaUsage;
+  firstSeconds?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function durationSeconds(value: unknown): number | undefined {
+  const duration = nonnegativeInteger(value);
+  return duration === undefined ? undefined : duration / 1e9;
 }
 
 function parseToolCall(value: unknown): ToolCallRequest {
@@ -62,23 +81,30 @@ function parseChunk(line: string): OllamaChunk {
     content: message.content ?? "",
     thinking: message.thinking ?? "",
     toolCalls: (message.tool_calls ?? []).map(parseToolCall),
+    ...(value.done ? { usage: {
+      promptTokens: nonnegativeInteger(value.prompt_eval_count),
+      promptSeconds: durationSeconds(value.prompt_eval_duration),
+      outputTokens: nonnegativeInteger(value.eval_count),
+      outputSeconds: durationSeconds(value.eval_duration),
+      totalSeconds: durationSeconds(value.total_duration),
+    } } : {}),
   };
 }
 
-async function postOllama(
+async function requestOllama(
   settings: OllamaSettings,
-  endpoint: "show" | "chat",
-  body: Record<string, unknown>,
+  endpoint: "show" | "chat" | "ps",
+  body: Record<string, unknown> | undefined,
   signal: AbortSignal,
 ): Promise<Response> {
   signal.throwIfAborted();
   const response = await fetch(`${settings.serverUrl}/api/${endpoint}`, {
-    method: "POST",
+    method: body === undefined ? "GET" : "POST",
     headers: {
       "Content-Type": "application/json",
       ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}),
     },
-    body: JSON.stringify({ model: settings.model, ...body }),
+    body: body === undefined ? undefined : JSON.stringify({ model: settings.model, ...body }),
     signal,
   });
   if (!response.ok) {
@@ -90,6 +116,33 @@ async function postOllama(
   return response;
 }
 
+function taggedModel(model: string): string {
+  return model.lastIndexOf(":") > model.lastIndexOf("/") ? model : `${model}:latest`;
+}
+
+export async function getOllamaContextLength(
+  settings: OllamaSettings, signal: AbortSignal,
+): Promise<number | undefined> {
+  try {
+    // Optional statistics must not leave a completed answer waiting indefinitely.
+    const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(3000)]);
+    const response = await requestOllama(settings, "ps", undefined, lookupSignal);
+    const data: unknown = await response.json();
+    if (!isRecord(data) || !Array.isArray(data.models)) return undefined;
+    const limits = new Set<number>();
+    for (const model of data.models) {
+      if (!isRecord(model) || ![model.name, model.model].some(name =>
+        typeof name === "string" && taggedModel(name) === taggedModel(settings.model))) continue;
+      const limit = nonnegativeInteger(model.context_length);
+      if (limit === undefined || limit === 0) return undefined;
+      limits.add(limit);
+    }
+    return limits.size === 1 ? limits.values().next().value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function* streamOllamaChat(
   settings: OllamaSettings,
   messages: OllamaMessage[],
@@ -98,7 +151,7 @@ export async function* streamOllamaChat(
   signal: AbortSignal,
 ): AsyncGenerator<OllamaChunk> {
   if (messages.some(message => message.images?.length)) {
-    const response = await postOllama(settings, "show", {}, signal);
+    const response = await requestOllama(settings, "show", {}, signal);
     const model: unknown = await response.json();
     if (!isRecord(model) || !Array.isArray(model.capabilities)
       || !model.capabilities.every(capability => typeof capability === "string")) {
@@ -108,7 +161,8 @@ export async function* streamOllamaChat(
       throw new Error(`Model "${settings.model}" does not support image input. Select a vision model.`);
     }
   }
-  const response = await postOllama(settings, "chat", {
+  const startedAt = performance.now();
+  const response = await requestOllama(settings, "chat", {
     messages,
     ...(tools.length ? { tools } : {}),
     stream: true,
@@ -119,6 +173,7 @@ export async function* streamOllamaChat(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let firstSeconds: number | undefined;
   try {
     while (true) {
       signal.throwIfAborted();
@@ -132,6 +187,10 @@ export async function* streamOllamaChat(
         if (!line) continue;
         signal.throwIfAborted();
         const chunk = parseChunk(line);
+        if (firstSeconds === undefined && (chunk.content || chunk.thinking || chunk.toolCalls.length)) {
+          firstSeconds = (performance.now() - startedAt) / 1000;
+        }
+        if (chunk.done) chunk.firstSeconds = firstSeconds;
         yield chunk;
         if (chunk.done) return;
       }

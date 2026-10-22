@@ -2,7 +2,8 @@ import { type Chat, type ChatMessage, type GeneratorController, type ToolCallReq
 import { readFile } from "node:fs/promises";
 import { configSchematics, globalConfigSchematics } from "./config";
 import { resolveGenerationOptions } from "./generation-options";
-import { type OllamaMessage, streamOllamaChat } from "./ollama-client";
+import { formatStatsFooter, stripStatsFooter } from "./generation-stats";
+import { getOllamaContextLength, type OllamaMessage, type OllamaUsage, streamOllamaChat } from "./ollama-client";
 import { resolveOllamaSettings } from "./ollama-settings";
 
 function requireToolCallId(id: string | undefined): string {
@@ -54,7 +55,7 @@ async function toOllamaMessages(history: Chat, ctl: GeneratorController): Promis
         });
         messages.push({
           role,
-          content: message.getText(),
+          content: stripStatsFooter(message.getText()),
           ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         });
         break;
@@ -84,12 +85,23 @@ export async function generate(ctl: GeneratorController, history: Chat) {
       apiKey: globalConfig.get("apiKey"),
       model: config.get("model"),
     });
+    const statsOptions = {
+      tokens: globalConfig.get("outputStats"),
+      time: globalConfig.get("inputStats"),
+      context: globalConfig.get("contextUsage"),
+    };
     const stream = streamOllamaChat(settings, await toOllamaMessages(history, ctl), ctl.getToolDefinitions(),
       resolveGenerationOptions(globalConfig), ctl.abortSignal);
     const calls: ToolCallRequest[] = [];
     const callIds = new Set<string>();
+    let usage: OllamaUsage | undefined;
+    let firstSeconds: number | undefined;
     for await (const chunk of stream) {
       ctl.abortSignal.throwIfAborted();
+      if (chunk.done) {
+        usage = chunk.usage;
+        firstSeconds = chunk.firstSeconds;
+      }
       if (chunk.thinking) ctl.fragmentGenerated(chunk.thinking, { reasoningType: "reasoning" });
       if (chunk.content) ctl.fragmentGenerated(chunk.content);
       for (const call of chunk.toolCalls) {
@@ -107,6 +119,12 @@ export async function generate(ctl: GeneratorController, history: Chat) {
       ctl.toolCallGenerationNameReceived(call.name);
       ctl.toolCallGenerationArgumentFragmentGenerated(JSON.stringify(call.arguments));
       ctl.toolCallGenerationEnded(call);
+    }
+    if (!calls.length && (statsOptions.tokens || statsOptions.time || statsOptions.context)) {
+      const contextLength = statsOptions.context
+        ? await getOllamaContextLength(settings, ctl.abortSignal) : undefined;
+      ctl.abortSignal.throwIfAborted();
+      ctl.fragmentGenerated(formatStatsFooter(statsOptions, usage, firstSeconds, contextLength), { tokenCount: 0 });
     }
   } catch (error) {
     // Finish normally on user cancellation so partial output stays without a failure banner.

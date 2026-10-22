@@ -7,7 +7,7 @@ import {
 
 export type CheckboxNumericValue = GlobalKVFieldValueTypeLibraryMap["checkboxNumeric"]["value"];
 
-type SettingsFieldType = "string" | "select" | "checkboxNumeric";
+type SettingsFieldType = "string" | "select" | "checkboxNumeric" | "boolean";
 type SettingsBuilder<T extends VirtualConfigSchematics> = Omit<ConfigSchematicsBuilder<T>, "field"> & {
   field<TKey extends string, TType extends SettingsFieldType>(
     key: TKey,
@@ -106,4 +106,17 @@ export const globalConfigSchematics = createSettingsBuilder()
     hint: "Use -1 for a random seed.",
     min: -1, max: 2147483647, int: true,
   }, { checked: false, value: 0 })
+  // Preserve stored keys so existing statistics settings keep their enabled state.
+  .field("outputStats", "boolean", {
+    displayName: "(Alpha) Token Stats",
+    subtitle: "Append output speed and generated token count.",
+  }, false)
+  .field("inputStats", "boolean", {
+    displayName: "(Alpha) Time Stats",
+    subtitle: "First includes network time; Processing and Total are server times.",
+  }, false)
+  .field("contextUsage", "boolean", {
+    displayName: "(Alpha) Context Usage",
+    subtitle: "Append estimated context usage and the loaded context limit.",
+  }, false)
   .build();

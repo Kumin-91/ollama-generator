@@ -9,4 +9,4 @@ Based on [LM Studio’s OpenAI Adapter](https://lmstudio.ai/lmstudio/openai-comp
 Limitations:
 
 - Image attachments are currently unavailable with the adaptor alone.
-- Native context usage and generation statistics (token counts and tokens/s) are not currently displayed.
+- Native statistics displays are unavailable. Optional Alpha settings append token, timing, and estimated context statistics to responses.
