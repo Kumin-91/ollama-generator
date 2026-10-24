@@ -1,19 +1,23 @@
-import { type LLMTool, type ToolCallRequest } from "@lmstudio/sdk";
+import { type LLMTool } from "@lmstudio/sdk";
 import { randomUUID } from "node:crypto";
-import { type GenerationOptions } from "./generation-options";
-import { type OllamaSettings } from "./ollama-settings";
+import { type GenerationOptions, type OllamaSettings } from "./settings";
 
-export type OllamaToolCall = ToolCallRequest & {
+export const DEFAULT_REQUEST_TIMEOUT_SECONDS = 600;
+const MAX_STREAM_LINE_BYTES = 1024 * 1024;
+const MAX_JSON_BYTES = 8 * 1024 * 1024;
+const MAX_TOOL_CALLS = 128;
+
+export interface OllamaToolCall {
   id: string;
-  arguments: Record<string, unknown>;
-};
+  function: { name: string; arguments: Record<string, unknown> };
+}
 
 export interface OllamaMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   thinking?: string;
   images?: string[];
-  tool_calls?: { id: string; function: { name: string; arguments: Record<string, unknown> } }[];
+  tool_calls?: OllamaToolCall[];
   tool_name?: string;
   tool_call_id?: string;
 }
@@ -39,6 +43,7 @@ export interface OllamaGenerationRequest {
   tools: LLMTool[];
   options: GenerationOptions;
   signal: AbortSignal;
+  timeoutMs?: number;
   onThinking: (text: string) => void;
   onContent: (text: string) => void;
 }
@@ -71,10 +76,8 @@ function parseToolCall(value: unknown): OllamaToolCall {
     throw new Error("Ollama returned an invalid tool call.");
   }
   return {
-    type: "function",
     id: value.id || randomUUID(),
-    name: value.function.name,
-    arguments: value.function.arguments,
+    function: { name: value.function.name, arguments: value.function.arguments },
   };
 }
 
@@ -120,6 +123,7 @@ async function requestOllama(
   signal.throwIfAborted();
   const response = await fetch(`${settings.serverUrl}/api/${endpoint}`, {
     method: body === undefined ? "GET" : "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       ...(settings.apiKey ? { Authorization: `Bearer ${settings.apiKey}` } : {}),
@@ -127,8 +131,13 @@ async function requestOllama(
     body: body === undefined ? undefined : JSON.stringify({ model: settings.model, ...body }),
     signal,
   });
+  if (response.status >= 300 && response.status < 400) {
+    void response.body?.cancel().catch(() => {});
+    throw new Error("Ollama redirected the request. Enter the final server URL.");
+  }
   if (!response.ok) {
-    const error: unknown = await response.json().catch(() => null);
+    const error: unknown = await readJson(response, signal).catch(() => null);
+    signal.throwIfAborted();
     throw new Error(isRecord(error) && typeof error.error === "string"
       ? `Ollama (${response.status}): ${error.error}`
       : `Ollama request failed (HTTP ${response.status}).`);
@@ -147,7 +156,7 @@ export async function getOllamaContextLength(
     // Optional statistics must not leave a completed answer waiting indefinitely.
     const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(3000)]);
     const response = await requestOllama(settings, "ps", undefined, lookupSignal);
-    const data: unknown = await response.json();
+    const data = await readJson(response, lookupSignal);
     if (!isRecord(data) || !Array.isArray(data.models)) return undefined;
     const limits = new Set<number>();
     for (const model of data.models) {
@@ -163,67 +172,125 @@ export async function getOllamaContextLength(
   }
 }
 
-export async function generateOllama({
-  settings, messages, tools, options, signal, onThinking, onContent,
-}: OllamaGenerationRequest): Promise<OllamaGenerationResult> {
-  if (messages.some(message => message.images?.length)) {
-    const response = await requestOllama(settings, "show", {}, signal);
-    const model: unknown = await response.json();
-    if (!isRecord(model) || !Array.isArray(model.capabilities)
-      || !model.capabilities.every(capability => typeof capability === "string")) {
-      throw new Error("Ollama did not return valid model capabilities for image input.");
-    }
-    if (!model.capabilities.includes("vision")) {
-      throw new Error(`Model "${settings.model}" does not support image input. Select a vision model.`);
-    }
-  }
-  const startedAt = performance.now();
-  const response = await requestOllama(settings, "chat", {
-    messages,
-    ...(tools.length ? { tools } : {}),
-    stream: true,
-    ...options,
-  }, signal);
+async function* readBody(response: Response, signal: AbortSignal): AsyncGenerator<Uint8Array> {
   if (!response.body) throw new Error("Ollama returned an empty response body.");
-
   const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let firstSeconds: number | undefined;
-  const toolCalls: OllamaToolCall[] = [];
-  const callIds = new Set<string>();
+  const onAbort = () => { void reader.cancel(signal.reason).catch(() => {}); };
+  signal.addEventListener("abort", onAbort, { once: true });
   try {
     while (true) {
       signal.throwIfAborted();
       const { value, done } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
-      if (done && buffer.trim()) buffer += "\n";
-      let newline: number;
-      while ((newline = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line) continue;
-        signal.throwIfAborted();
-        const chunk = parseChunk(line);
-        if (firstSeconds === undefined && (chunk.content || chunk.thinking || chunk.toolCalls.length)) {
-          firstSeconds = (performance.now() - startedAt) / 1000;
-        }
-        if (chunk.thinking) onThinking(chunk.thinking);
-        if (chunk.content) onContent(chunk.content);
-        for (const call of chunk.toolCalls) {
-          if (callIds.has(call.id)) throw new Error("Ollama returned a duplicate tool call ID.");
-          callIds.add(call.id);
-          toolCalls.push(call);
-        }
-        signal.throwIfAborted();
-        // Tool calls are available only after a successful, complete stream.
-        if (chunk.done) return { toolCalls, usage: chunk.usage, firstSeconds, doneReason: chunk.doneReason };
+      signal.throwIfAborted();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    // Start cancellation without waiting for an unresponsive source to acknowledge it.
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+async function readJson(response: Response, signal: AbortSignal): Promise<unknown> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let text = "";
+  let bytes = 0;
+  for await (const value of readBody(response, signal)) {
+    bytes += value.byteLength;
+    if (bytes > MAX_JSON_BYTES) throw new Error("Ollama JSON response exceeds the 8 MiB limit.");
+    text += decoder.decode(value, { stream: true });
+  }
+  return JSON.parse(text + decoder.decode());
+}
+
+async function* readStreamLines(response: Response, signal: AbortSignal): AsyncGenerator<string> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let buffer = "";
+  let lineBytes = 0;
+  for await (const value of readBody(response, signal)) {
+    let start = 0;
+    while (start < value.length) {
+      const newline = value.indexOf(10, start);
+      const end = newline === -1 ? value.length : newline;
+      lineBytes += end - start;
+      if (lineBytes > MAX_STREAM_LINE_BYTES) {
+        throw new Error("Ollama streaming JSON line exceeds the 1 MiB limit.");
       }
-      if (done) break;
+      buffer += decoder.decode(value.subarray(start, end), { stream: newline === -1 });
+      if (newline === -1) break;
+      yield buffer;
+      buffer = "";
+      lineBytes = 0;
+      start = newline + 1;
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) yield buffer;
+}
+
+export async function generateOllama({
+  settings, messages, tools, options, signal: parentSignal,
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_SECONDS * 1000, onThinking, onContent,
+}: OllamaGenerationRequest): Promise<OllamaGenerationResult> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) {
+    throw new Error("Ollama request timeout must be between 1 ms and 24 hours.");
+  }
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(new DOMException(
+    `Ollama request timed out after ${timeoutMs / 1000} seconds.`, "TimeoutError",
+  )), timeoutMs);
+  timer.unref();
+  const signal = AbortSignal.any([parentSignal, timeout.signal]);
+  try {
+    if (messages.some(message => message.images?.length)) {
+      const response = await requestOllama(settings, "show", {}, signal);
+      const model = await readJson(response, signal);
+      if (!isRecord(model) || !Array.isArray(model.capabilities)
+        || !model.capabilities.every(capability => typeof capability === "string")) {
+        throw new Error("Ollama did not return valid model capabilities for image input.");
+      }
+      if (!model.capabilities.includes("vision")) {
+        throw new Error(`Model "${settings.model}" does not support image input. Select a vision model.`);
+      }
+    }
+    const startedAt = performance.now();
+    const response = await requestOllama(settings, "chat", {
+      messages,
+      ...(tools.length ? { tools } : {}),
+      stream: true,
+      ...options,
+    }, signal);
+    let firstSeconds: number | undefined;
+    const toolCalls: OllamaToolCall[] = [];
+    const callIds = new Set<string>();
+    for await (const rawLine of readStreamLines(response, signal)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      signal.throwIfAborted();
+      const chunk = parseChunk(line);
+      if (firstSeconds === undefined && (chunk.content || chunk.thinking || chunk.toolCalls.length)) {
+        firstSeconds = (performance.now() - startedAt) / 1000;
+      }
+      if (chunk.thinking) onThinking(chunk.thinking);
+      signal.throwIfAborted();
+      if (chunk.content) onContent(chunk.content);
+      for (const call of chunk.toolCalls) {
+        if (toolCalls.length >= MAX_TOOL_CALLS) throw new Error("Ollama exceeded the limit of 128 tool calls per request.");
+        if (callIds.has(call.id)) throw new Error("Ollama returned a duplicate tool call ID.");
+        callIds.add(call.id);
+        toolCalls.push(call);
+      }
+      signal.throwIfAborted();
+      // Tool calls are available only after a successful, complete stream.
+      if (chunk.done) return { toolCalls, usage: chunk.usage, firstSeconds, doneReason: chunk.doneReason };
     }
     throw new Error("Ollama stream ended before completion.");
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
   } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    clearTimeout(timer);
   }
 }

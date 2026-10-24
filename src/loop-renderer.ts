@@ -46,15 +46,15 @@ export function createLoopRenderer(ctl: PredictionLoopHandlerController, model: 
     attachGenInfo(result: OllamaGenerationResult, contextLength?: number, reason?: LLMPredictionStopReason) {
       const info = nativeGenerationInfo(model, result, contextUsage, contextLength, reason);
       lastBlock?.attachGenInfo(info);
-      if (contextUsage && !result.toolCalls.length && !reason) {
+      if (contextUsage && !result.toolCalls.length && !reason && !ctl.abortSignal.aborted) {
         const used = info.stats.totalTokensCount;
         const count = (value: number | undefined) => value?.toLocaleString("en-US") ?? "N/A";
         const percentage = used !== undefined && contextLength !== undefined
           ? `${(used / contextLength * 100).toFixed(2)}%` : "N/A";
-        ctl.createContentBlock({ includeInContext: false }).appendText(
-          `---\n\n**Context:** ${count(used)} / ${count(contextLength)} tokens (${percentage})`,
-          { tokensCount: 0 },
-        );
+        ctl.createStatus({
+          status: "done",
+          text: `Context (last request): ${count(used)} / ${count(contextLength)} tokens (${percentage})`,
+        });
       }
     },
     message() {
@@ -63,19 +63,14 @@ export function createLoopRenderer(ctl: PredictionLoopHandlerController, model: 
   };
 }
 
-function stopReason(result: OllamaGenerationResult): LLMPredictionStopReason {
-  if (result.toolCalls.length) return "toolCalls";
-  if (result.doneReason === "length") return "maxPredictedTokensReached";
-  // Ollama's normal `stop` does not distinguish EOS from a stop string.
-  // The SDK requires a reason, so completed responses use its EOS category.
-  return "eosFound";
-}
-
 export function nativeGenerationInfo(
   model: string, result: OllamaGenerationResult, contextUsage: boolean,
   contextLength?: number, reason?: LLMPredictionStopReason,
 ): LLMGenInfo {
   const { usage } = result;
+  // Ollama's generic `stop` cannot distinguish EOS from stop strings; the SDK requires a category.
+  const stopReason = reason ?? (result.toolCalls.length ? "toolCalls"
+    : result.doneReason === "length" ? "maxPredictedTokensReached" : "eosFound");
   const totalTokens = usage?.promptTokens !== undefined && usage.outputTokens !== undefined
     && Number.isSafeInteger(usage.promptTokens + usage.outputTokens)
     ? usage.promptTokens + usage.outputTokens : undefined;
@@ -87,7 +82,7 @@ export function nativeGenerationInfo(
     ] },
     predictionConfig: { fields: [] },
     stats: {
-      stopReason: reason ?? stopReason(result),
+      stopReason,
       tokensPerSecond: usage?.outputTokens !== undefined && usage.outputSeconds !== undefined
         && usage.outputSeconds > 0 ? usage.outputTokens / usage.outputSeconds : undefined,
       predictedTokensCount: usage?.outputTokens,

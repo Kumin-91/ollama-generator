@@ -1,22 +1,9 @@
 import { type LLMTool, type PredictionLoopHandlerController, type PredictionProcessContentBlockController } from "@lmstudio/sdk";
 import { type OllamaMessage, type OllamaToolCall } from "./ollama-client";
+import { withAbort } from "./abort";
 
 type ToolSession = Awaited<ReturnType<PredictionLoopHandlerController["startToolUseSession"]>>;
 type LoopTool = ToolSession["tools"][number];
-
-export async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  let onAbort: () => void = () => {};
-  const aborted = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(signal.reason);
-    if (signal.aborted) onAbort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  });
-  try {
-    return await Promise.race([operation, aborted]);
-  } finally {
-    signal.removeEventListener("abort", onAbort);
-  }
-}
 
 export async function openToolSession(ctl: PredictionLoopHandlerController): Promise<ToolSession> {
   ctl.abortSignal.throwIfAborted();
@@ -55,9 +42,10 @@ export async function executeLoopTool(
   callId: number,
 ): Promise<OllamaMessage> {
   ctl.abortSignal.throwIfAborted();
+  const fn = call.function;
   const request = () => ({
-    callId, toolCallRequestId: call.id, name: call.name,
-    parameters: call.arguments, pluginIdentifier: tool?.pluginIdentifier,
+    callId, toolCallRequestId: call.id, name: fn.name,
+    parameters: fn.arguments, pluginIdentifier: tool?.pluginIdentifier,
   });
   block.appendToolRequest(request());
   const status = ctl.createToolStatus(callId, { type: "toolCallQueued" });
@@ -65,20 +53,22 @@ export async function executeLoopTool(
     ctl.createContentBlock({ roleOverride: "tool" }).appendToolResult({
       callId, toolCallRequestId: call.id, content,
     });
-    return { role: "tool", content, tool_call_id: call.id, tool_name: call.name };
+    return { role: "tool", content, tool_call_id: call.id, tool_name: fn.name };
+  };
+  const invalidArguments = (error: unknown) => {
+    const message = errorMessage(error);
+    status.setStatus({ type: "toolCallGenerationFailed", error: message });
+    return result(JSON.stringify({ error: message }));
   };
   try {
     try {
-      if (!tool) throw new Error(`Unknown tool: "${call.name}".`);
-      tool.checkParameters(call.arguments);
+      if (!tool) throw new Error(`Unknown tool: "${fn.name}".`);
+      tool.checkParameters(fn.arguments);
     } catch (error) {
-      status.setStatus({ type: "toolCallGenerationFailed", error: errorMessage(error) });
-      return result(JSON.stringify({ error: errorMessage(error) }));
+      return invalidArguments(error);
     }
     status.setStatus({ type: "confirmingToolCall" });
-    const confirmation = await ctl.requestConfirmToolCall({
-      callId, pluginIdentifier: tool.pluginIdentifier, name: call.name, parameters: call.arguments,
-    });
+    const confirmation = await ctl.requestConfirmToolCall(request());
     ctl.abortSignal.throwIfAborted();
     if (confirmation.type === "deny") {
       status.setStatus({ type: "toolCallDenied", denyReason: confirmation.denyReason });
@@ -88,22 +78,22 @@ export async function executeLoopTool(
       try {
         tool.checkParameters(confirmation.toolArgsOverride);
       } catch (error) {
-        status.setStatus({ type: "toolCallGenerationFailed", error: errorMessage(error) });
-        return result(JSON.stringify({ error: errorMessage(error) }));
+        return invalidArguments(error);
       }
-      call.arguments = confirmation.toolArgsOverride;
+      fn.arguments = confirmation.toolArgsOverride;
       block.replaceToolRequest(request());
     }
     status.setStatus({ type: "callingTool" });
+    ctl.abortSignal.throwIfAborted();
     const started = performance.now();
-    const value: unknown = await withAbort(Promise.resolve(tool.implementation(call.arguments, {
+    const value: unknown = await withAbort(Promise.resolve(tool.implementation(fn.arguments, {
       callId, signal: ctl.abortSignal,
       status: text => status.setCustomStatusText(text), warn: text => status.addWarning(text),
     })), ctl.abortSignal);
     ctl.abortSignal.throwIfAborted();
-    const content = value === undefined ? "undefined" : JSON.stringify(value);
-    if (content === undefined) throw new Error(`Tool "${call.name}" returned a value that cannot be serialized.`);
-    status.setStatus({ type: "toolCallSucceeded", timeMs: performance.now() - started });
+    const content = typeof value === "string" ? value : value === undefined ? "undefined" : JSON.stringify(value);
+    if (content === undefined) throw new Error(`Tool "${fn.name}" returned a value that cannot be serialized.`);
+    status.setStatus({ type: "toolCallSucceeded", timeMs: Math.round(performance.now() - started) });
     return result(content);
   } catch (error) {
     status.setStatus({ type: "toolCallFailed", error: ctl.abortSignal.aborted ? "Tool call stopped." : errorMessage(error) });
